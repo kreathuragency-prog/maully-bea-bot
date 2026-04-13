@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+{% block title %}Dashboard{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h1>Dashboard</h1>
+</div>
+
+<div class="stats">
+    <div class="stat-card">
+        <div class="number">{{ stats.contacts }}</div>
+        <div class="label">Contactos</div>
+    </div>
+    <div class="stat-card">
+        <div class="number">{{ stats.active_conversations }}</div>
+        <div class="label">Chats activos</div>
+    </div>
+    <div class="stat-card">
+        <div class="number">{{ stats.messages }}</div>
+        <div class="label">Mensajes</div>
+    </div>
+    <div class="stat-card">
+        <div class="number">{{ stats.leads }}</div>
+        <div class="label">Leads</div>
+    </div>
+</div>
+
+<div class="section-title">Chats recientes</div>
+
+{% if conversations %}
+<div class="table-wrap">
+    <table>
+        <thead>
+            <tr>
+                <th>Telefono</th>
+                <th>Ultimo mensaje</th>
+                <th>Msgs</th>
+                <th>Actualizado</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for conv in conversations %}
+            <tr onclick="location.href='/crm/conversation/{{ conv.id }}'">
+                <td style="font-family: 'JetBrains Mono', monospace; font-size: 13px;">{{ conv.phone }}</td>
+                <td>
+                    <span class="{{ 'dir-in' if conv.last_direction == 'inbound' else 'dir-out' }}">
+                        {{ '←' if conv.last_direction == 'inbound' else '→' }}
+                    </span>
+                    {{ conv.last_message }}
+                </td>
+                <td style="font-family: 'JetBrains Mono', monospace;">{{ conv.msg_count }}</td>
+                <td style="color: var(--text2); font-size: 12px;">{{ conv.updated_at }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% else %}
+<div class="empty">
+    <div class="empty-icon">💬</div>
+    <p>No hay chats aun.<br>Envia un mensaje al WhatsApp de Bea para empezar.</p>
+</div>
+{% endif %}
+{% endblock %}

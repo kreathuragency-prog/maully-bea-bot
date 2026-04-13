@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% block title %}Chat {{ conv.phone }}{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h1>
+        <span style="font-family: 'JetBrains Mono', monospace; font-size: 22px;">{{ conv.phone }}</span>
+    </h1>
+    <span style="color: var(--text3); font-size: 12px; font-family: 'JetBrains Mono', monospace;">
+        {{ conv.created_at }}
+    </span>
+</div>
+
+<div class="chat-container">
+    <div class="chat-messages" id="chatMessages">
+        {% for msg in conv.messages %}
+        <div class="msg msg-{{ msg.direction }}">
+            <div class="msg-label">
+                {{ 'Cliente' if msg.direction == 'inbound' else 'Bea' }}
+            </div>
+            {{ msg.text }}
+            <div class="msg-time">{{ msg.date }} · {{ msg.time }}</div>
+        </div>
+        {% endfor %}
+
+        {% if not conv.messages %}
+        <div class="empty">
+            <p>No hay mensajes.</p>
+        </div>
+        {% endif %}
+    </div>
+
+    <form class="reply-form" method="POST" action="/crm/conversation/{{ conv.id }}/reply">
+        <textarea name="message" placeholder="Responder como Bea..." rows="1"
+            onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();this.form.submit()}"
+            oninput="this.style.height='auto';this.style.height=this.scrollHeight+'px'"></textarea>
+        <button type="submit" class="btn">Enviar</button>
+    </form>
+</div>
+
+<script>
+    const chat = document.getElementById('chatMessages');
+    chat.scrollTop = chat.scrollHeight;
+</script>
+{% endblock %}
