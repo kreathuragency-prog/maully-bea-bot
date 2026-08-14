@@ -25,8 +25,21 @@ from jinja2 import Environment, FileSystemLoader
 from dotenv import load_dotenv
 
 from whatsapp import parsear_mensaje, enviar_mensaje, transcribir_audio, close_http_client
-from brain import generar_respuesta, cargar_info_web
-from scraper import scrape_maully
+from scraper import scrape_maully, scrape_puntoski
+
+# ── Brain dinámico según BOT_MODE ─────────────────────────────
+# BOT_MODE=dual      → brain.py (Maully + PuntoSki, default actual)
+# BOT_MODE=maully    → brain_maully.py (solo fardos B2B)
+# BOT_MODE=puntoski  → brain_puntoski.py (solo ski retail)
+_BOT_MODE = os.getenv("BOT_MODE", "dual").lower()
+if _BOT_MODE == "maully":
+    from brain_maully import generar_respuesta, cargar_info_maully  # type: ignore
+    cargar_info_puntoski = lambda _: None  # noqa: E731
+elif _BOT_MODE == "puntoski":
+    from brain_puntoski import generar_respuesta, cargar_info_puntoski  # type: ignore
+    cargar_info_maully = lambda _: None  # noqa: E731
+else:
+    from brain import generar_respuesta, cargar_info_maully, cargar_info_puntoski  # type: ignore
 from checkout import router as checkout_router
 from admin_panel import router as admin_router
 from database import init_db
@@ -106,9 +119,23 @@ _RE_TELEFONO = re.compile(r"\+?\d{8,20}")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
-    info_web = await scrape_maully()
-    cargar_info_web(info_web)
-    logger.info("Bea Bot (Importadora Maully) iniciado en puerto %d", PORT)
+
+    # Scrape paralelo de ambos sitios
+    info_maully, info_puntoski = await asyncio.gather(
+        scrape_maully(),
+        scrape_puntoski(),
+        return_exceptions=True,
+    )
+    if isinstance(info_maully, str):
+        cargar_info_maully(info_maully)
+    else:
+        logger.warning(f"Scrape Maully falló: {info_maully}")
+    if isinstance(info_puntoski, str):
+        cargar_info_puntoski(info_puntoski)
+    else:
+        logger.warning(f"Scrape Punto Ski falló: {info_puntoski}")
+
+    logger.info("Bea Bot (Maully + Punto Ski) iniciado en puerto %d", PORT)
     yield
 
     # Shutdown ordenado
@@ -144,7 +171,11 @@ app = FastAPI(title="Importadora Maully — Bea WhatsApp Bot + E-Commerce", life
 # CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://www.importadoramaully.cl", "https://importadoramaully.cl", "http://localhost:3002"],
+    allow_origins=[
+        "https://www.importadoramaully.cl", "https://importadoramaully.cl",
+        "https://www.puntoski.com", "https://puntoski.com",
+        "http://localhost:3002", "http://localhost:8080",
+    ],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -292,6 +323,180 @@ async def _responder(telefono: str, texto_para_ia: str, texto_para_db: str):
 # ══════════════════════════════════════════════════════════════
 # PANEL CRM (conversaciones de WhatsApp)
 # ══════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════════
+# API EXTERNA — para integración con CRM Kreathur (envío manual)
+# ══════════════════════════════════════════════════════════════
+
+EXTERNAL_API_KEY = os.getenv("EXTERNAL_API_KEY", "kreathur-bridge-2026")
+
+
+@app.post("/api/external/send")
+async def api_external_send(request: Request):
+    """Envía un mensaje WhatsApp manualmente (desde el CRM Kreathur).
+
+    Auth: header X-API-Key debe coincidir con EXTERNAL_API_KEY.
+    Body: {"phone": "+5697...", "text": "Hola..."}
+    """
+    api_key = request.headers.get("X-API-Key", "")
+    if api_key != EXTERNAL_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+    try:
+        data = await request.json()
+        phone = (data.get("phone") or "").strip()
+        text = (data.get("text") or "").strip()
+        if not phone or not text:
+            raise HTTPException(status_code=400, detail="phone and text required")
+
+        # Normaliza el teléfono (quita +, espacios, paréntesis)
+        phone_clean = "".join(c for c in phone if c.isdigit())
+
+        # Persiste el mensaje en bot.db como outbound manual
+        contact = await get_or_create_contact(phone_clean)
+        conv = await get_or_create_conversation(contact.id)
+        await save_message(conv.id, "outbound", text)
+
+        # Envía via Meta Cloud API
+        ok = await enviar_mensaje(phone_clean, text)
+        if not ok:
+            raise HTTPException(status_code=500, detail="Meta API error")
+
+        logger.info(f"[CRM-BRIDGE] [{mask_phone(phone_clean)}] <- {mask_text(text)}")
+        return {"ok": True, "conversation_id": conv.id, "phone": phone_clean}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error /api/external/send: {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ══════════════════════════════════════════════════════════════
+# WEB TRACK — endpoint ligero para persistir interacciones del widget
+# web (FAQs, clicks, mensajes que se derivan a WhatsApp). No corre IA.
+# Solo guarda en bot.db para que se vean en /crm/conversations.
+# ══════════════════════════════════════════════════════════════
+
+@app.post("/api/track-web")
+async def api_track_web(request: Request):
+    """Persiste un mensaje del widget web en bot.db.
+    Body: {sessionId, userMessage, botReply?, businessSlug?, url?, userAgent?}
+    """
+    try:
+        data = await request.json()
+    except Exception:
+        return {"ok": False, "error": "invalid_json"}
+
+    session_id = (data.get("sessionId") or "").strip()[:80]
+    user_msg = (data.get("userMessage") or "").strip()[:1000]
+    bot_reply = (data.get("botReply") or "").strip()[:2000]
+    business = (data.get("businessSlug") or "maully").strip().lower()[:20]
+    url = (data.get("url") or "").strip()[:200]
+
+    if not session_id or not user_msg:
+        return {"ok": False, "error": "missing_fields"}
+
+    # Sanitiza
+    user_msg = "".join(c for c in user_msg if c >= " " or c in "\n\t")
+    bot_reply = "".join(c for c in bot_reply if c >= " " or c in "\n\t")
+
+    try:
+        # Teléfono virtual: web-<sessionId> mapeado a un contact deterministico
+        virtual_phone = f"web-{session_id}"[:50]
+        contact = await get_or_create_contact(virtual_phone)
+        conv = await get_or_create_conversation(contact.id)
+        await save_message(conv.id, "inbound", f"[{business}] {user_msg}")
+        if bot_reply:
+            await save_message(conv.id, "outbound", bot_reply)
+        await get_or_create_lead(contact.id, business)
+        logger.info(f"[WEB-TRACK {business}/{session_id[:8]}] {mask_text(user_msg)}")
+        return {"ok": True, "contactId": contact.id, "conversationId": conv.id}
+    except Exception as e:
+        logger.error(f"track-web error: {type(e).__name__}: {e}")
+        return {"ok": False, "error": "db_error"}
+
+
+# ══════════════════════════════════════════════════════════════
+# WEB CHAT — endpoint para widget en sitios públicos (no requiere auth,
+# pero limitado por CORS allowlist + simple rate por sessionId)
+# ══════════════════════════════════════════════════════════════
+
+_web_chat_rate: dict[str, list[float]] = {}
+_WEB_CHAT_MAX_PER_MIN = 20
+_WEB_CHAT_MAX_TEXT = 500
+_web_chat_sessions: dict[str, list[dict]] = {}
+_WEB_CHAT_HISTORY_MAX = 12  # últimos N turnos por sesión
+
+
+def _rate_ok(session_id: str) -> bool:
+    now = time.time()
+    bucket = _web_chat_rate.setdefault(session_id, [])
+    # purge >60s
+    bucket[:] = [t for t in bucket if now - t < 60]
+    if len(bucket) >= _WEB_CHAT_MAX_PER_MIN:
+        return False
+    bucket.append(now)
+    return True
+
+
+@app.post("/api/web-chat")
+async def api_web_chat(request: Request):
+    """Endpoint para widgets web (Maully, PuntoSki). Devuelve respuesta IA
+    en texto plano usando el mismo cerebro que WhatsApp.
+
+    Body: {"message": str, "sessionId": str, "business": "maully"|"puntoski"}
+    """
+    try:
+        data = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid json")
+
+    message = (data.get("message") or "").strip()
+    session_id = (data.get("sessionId") or "").strip()[:80]
+    business = (data.get("business") or "maully").strip().lower()
+
+    if not message:
+        raise HTTPException(status_code=400, detail="message required")
+    if not session_id:
+        session_id = f"anon-{int(time.time() * 1000)}"
+    if len(message) > _WEB_CHAT_MAX_TEXT:
+        message = message[:_WEB_CHAT_MAX_TEXT]
+    # Sanitiza chars de control
+    message = "".join(c for c in message if c >= " " or c in "\n\t")
+
+    if not _rate_ok(session_id):
+        raise HTTPException(status_code=429, detail="too many messages")
+
+    # Historial por sesión (en memoria — se pierde al reiniciar bot, OK)
+    history = _web_chat_sessions.setdefault(session_id, [])
+
+    # Pista de negocio para sesgar la respuesta sin romper la lógica dual
+    prefijo_business = ""
+    if business == "puntoski":
+        prefijo_business = "[Contexto: cliente está en sitio puntoski.com — orientar a Punto Ski salvo que diga lo contrario] "
+    elif business == "maully":
+        prefijo_business = "[Contexto: cliente está en sitio importadoramaully.cl — orientar a Maully salvo que pregunte ski/nieve personal] "
+
+    texto_para_ia = prefijo_business + message
+
+    try:
+        respuesta = await generar_respuesta(texto_para_ia, list(history))
+    except Exception as e:
+        logger.error(f"web-chat brain error [{session_id[:12]}]: {type(e).__name__}: {e}")
+        raise HTTPException(status_code=503, detail="ai_unavailable")
+
+    if not respuesta:
+        raise HTTPException(status_code=503, detail="empty_response")
+
+    # Persistir últimas N interacciones
+    history.append({"role": "user", "content": message})
+    history.append({"role": "assistant", "content": respuesta})
+    if len(history) > _WEB_CHAT_HISTORY_MAX * 2:
+        del history[: len(history) - _WEB_CHAT_HISTORY_MAX * 2]
+
+    logger.info(f"[WEB-CHAT {business}/{session_id[:8]}] -> {mask_text(message)} | <- {mask_text(respuesta)}")
+    return {"ok": True, "reply": respuesta, "sessionId": session_id}
+
 
 @app.get("/crm", response_class=HTMLResponse)
 async def crm_dashboard(request: Request):
